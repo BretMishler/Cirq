@@ -8,19 +8,20 @@ on:
 permissions: {}
 
 jobs:
-  push_to_pypi:
+  build:
     if: github.repository == 'quantumlib/Cirq'
-    name: Push to PyPI
+    name: Build wheels
     permissions:
       contents: read
       pull-requests: read
     runs-on: ubuntu-22.04
-    env:
-      NAME: dev-release
+    outputs:
+      should_publish: ${{ steps.build.outputs.should_publish }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
@@ -42,20 +43,11 @@ jobs:
             has_no_release=false
           fi
           echo "has_no_release=${has_no_release}" >> "${GITHUB_OUTPUT}"
-      - name: Install dependencies
+      - name: Build wheels
+        id: build
         if: steps.check-labels.outputs.has_no_release != 'true'
         run: |
-          python -m pip install --upgrade pip
-          pip install --upgrade setuptools twine
-      - name: Create PyPI config file
-        if: steps.check-labels.outputs.has_no_release != 'true'
-        env:
-          CIRQ_PYPI_TOKEN: ${{ secrets.CIRQ_PYPI_TOKEN }}
-        run: |
-          envsubst < dev_tools/packaging/pypirc_template > $HOME/.pypirc
-      - name: Build and publish
-        if: steps.check-labels.outputs.has_no_release != 'true'
-        run: |
+          python -m pip --version
           CIRQ_PRE_RELEASE_VERSION=$(dev_tools/packaging/generate-dev-version-id.sh)
           if [[ "${CIRQ_PRE_RELEASE_VERSION}" != *.dev* ]]; then
             echo "Not a dev version"
@@ -63,8 +55,9 @@ jobs:
           fi
           echo "Building wheels for the dev version '${CIRQ_PRE_RELEASE_VERSION}'"
           THIS_DATE_EPOCH=$(git log -1 --pretty="%ct")
-          out_dir="${HOME}/cirq-dist"
-          out_dir_last="${HOME}/cirq-dist-last"
+          out_dir="${RUNNER_TEMP}/cirq-dist"
+          out_dir_last="${RUNNER_TEMP}/cirq-dist-last"
+          mkdir -p "${out_dir}" "${out_dir_last}"
           dev_tools/packaging/produce-package.sh "${out_dir}" "${CIRQ_PRE_RELEASE_VERSION}"
           # disregard errors from building wheels at the previous commit
           SOURCE_DATE_EPOCH=${THIS_DATE_EPOCH} dev_tools/packaging/produce-package.sh \
@@ -72,10 +65,105 @@ jobs:
           echo "Comparing wheels with the build at previous commit"
           if diff -q -r "${out_dir_last}" "${out_dir}"; then
             echo "Wheels are identical - skipping the release"
-            echo "### Skipped identical release"  >> "${GITHUB_STEP_SUMMARY}"
+            echo "### Skipped identical release" >> "${GITHUB_STEP_SUMMARY}"
             echo "Cirq wheels for ${CIRQ_PRE_RELEASE_VERSION} (${GITHUB_SHA})" \
               "are identical to their build at the previous commit." >> "${GITHUB_STEP_SUMMARY}"
+            echo "should_publish=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
-          echo "Deploying dev version '$CIRQ_PRE_RELEASE_VERSION'"
-          twine upload "${out_dir}/*"
+          echo "should_publish=true" >> "${GITHUB_OUTPUT}"
+      - name: Upload wheel artifact
+        if: steps.build.outputs.should_publish == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cirq-dist
+          path: ${{ runner.temp }}/cirq-dist/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    if: github.repository == 'quantumlib/Cirq' && needs.build.outputs.should_publish == 'true'
+    name: Publish to PyPI
+    permissions: {}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download wheel artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cirq-dist
+          path: dist
+      - name: Verify dev wheels
+        run: |
+          set -euo pipefail
+          shopt -s nullglob dotglob
+
+          expected_pkgs=(
+            cirq
+            cirq-aqt
+            cirq-core
+            cirq-google
+            cirq-ionq
+            cirq-pasqal
+            cirq-web
+          )
+
+          entries=(dist/*)
+          if (( ${#entries[@]} != ${#expected_pkgs[@]} )); then
+            echo "Expected ${#expected_pkgs[@]} files in dist/, found ${#entries[@]}:"
+            printf '  %s\n' "${entries[@]}"
+            exit 1
+          fi
+
+          expected_version=""
+          for pkg in "${expected_pkgs[@]}"; do
+            pkg_norm="${pkg//-/_}"
+            matches=(dist/"${pkg_norm}"-*.whl)
+            if (( ${#matches[@]} != 1 )); then
+              echo "Expected exactly 1 wheel for ${pkg}, found ${#matches[@]}"
+              exit 1
+            fi
+            whl="${matches[0]}"
+            if [[ ! -f "${whl}" || -L "${whl}" ]]; then
+              echo "Expected regular file: ${whl}"
+              exit 1
+            fi
+            base="$(basename "${whl}")"
+            if [[ ! "${base}" =~ ^${pkg_norm}-([0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]+)-py3-none-any\.whl$ ]]; then
+              echo "Wheel filename does not match expected .dev pattern: ${base}"
+              exit 1
+            fi
+            file_version="${BASH_REMATCH[1]}"
+
+            mapfile -t meta_paths < <(unzip -Z1 "${whl}" | grep -E '^[^/]+\.dist-info/METADATA$' || true)
+            if (( ${#meta_paths[@]} != 1 )); then
+              echo "Expected exactly 1 METADATA file in ${base}, found ${#meta_paths[@]}"
+              exit 1
+            fi
+            meta_headers="$(unzip -p "${whl}" "${meta_paths[0]}" | tr -d '\r' | awk 'BEGIN{h=1} /^$/{h=0} h{print}')"
+            meta_name="$(printf '%s\n' "${meta_headers}" | sed -n -E 's/^Name:[[:space:]]*(.+)$/\1/p')"
+            meta_version="$(printf '%s\n' "${meta_headers}" | sed -n -E 's/^Version:[[:space:]]*(.+)$/\1/p')"
+
+            if [[ "${meta_name}" != "${pkg}" ]]; then
+              echo "METADATA Name mismatch in ${base}: got '${meta_name}', expected '${pkg}'"
+              exit 1
+            fi
+            if [[ "${meta_version}" != "${file_version}" ]]; then
+              echo "METADATA Version mismatch in ${base}: got '${meta_version}', expected '${file_version}'"
+              exit 1
+            fi
+            if [[ -z "${expected_version}" ]]; then
+              expected_version="${file_version}"
+            elif [[ "${file_version}" != "${expected_version}" ]]; then
+              echo "Inconsistent dev versions across wheels: ${base} has ${file_version}, expected ${expected_version}"
+              exit 1
+            fi
+          done
+          echo "Verified ${#expected_pkgs[@]} .dev wheels for version ${expected_version}"
+      - name: Publish wheels to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist/
+          password: ${{ secrets.CIRQ_PYPI_TOKEN }}
+          # Enable once Trusted Publishing is configured.
+          attestations: false
